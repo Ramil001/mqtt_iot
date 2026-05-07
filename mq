@@ -1,0 +1,318 @@
+/*
+ * TTGO T-A7670SA + Neo-M8N + MPU-6050 -> MQTT mit/tracker/ingest
+ * Простий варіант: без waitForNetwork (на LTE TinyGSM часто помиляється з CGREG).
+ */
+#define DEVICE_TOKEN "trk_37d4068b29dad73a49c2cf9c49b3e7bf703272a6"
+#define APN          "internet"
+#define APN_USER     ""
+#define APN_PASS     ""
+#define MQTT_HOST    "iot.mit.kh.ua"
+#define MQTT_PORT    1883
+#define MQTT_USER    "mit_iot"
+#define MQTT_PASS    "5KtXCmjcPcVriwpYyidzK0"
+#define FW_VERSION   "1.2.1-mqtt-gps-debug"
+/* 2=auto (GSM/WCDMA/LTE); 38=LTE-only — часто не піднімає PDP без LTE. */
+#ifndef MODEM_NETWORK_MODE
+#define MODEM_NETWORK_MODE 2
+#endif
+
+#define GPS_RX_PIN 22
+#define GPS_TX_PIN 21
+#define I2C_SDA_PIN 33
+#define I2C_SCL_PIN 32
+#define MODEM_RX 27
+#define MODEM_TX 26
+#define MODEM_PWRKEY 4
+#define MODEM_POWER_ON 12
+#define MQTT_TELEMETRY_MS 3000
+#define MQTT_RETRY_MS 8000
+
+#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_RX_BUFFER 1024
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define SerialMon Serial
+#define SerialAT Serial1
+#define SerialGPS Serial2
+
+TinyGsm modem(SerialAT);
+TinyGsmClient mqttClient(modem);
+PubSubClient mqtt(mqttClient);
+
+static String deviceToken = String(DEVICE_TOKEN);
+static String imeiCached;
+static uint32_t lastMqttMs;
+static uint32_t lastMqttTryMs;
+
+static char nmea[200];
+static size_t nmeaN;
+static bool gpsFix = false;
+static double gpsLat = 0.0;
+static double gpsLon = 0.0;
+
+static int imuAddr = -1;
+static const uint8_t IMU_ADDRS[] = {0x68, 0x69};
+
+static void bootLog(const char *msg) {
+  SerialMon.println(msg);
+  SerialMon.flush();
+}
+
+static bool i2cWrite8(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+static bool i2cReadBytes(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)addr, (int)len) != (int)len) return false;
+  for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
+  return true;
+}
+
+static bool initImu() {
+  for (uint8_t i = 0; i < sizeof(IMU_ADDRS); i++) {
+    uint8_t a = IMU_ADDRS[i];
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() != 0) continue;
+    uint8_t who = 0;
+    if (!i2cReadBytes(a, 0x75, &who, 1) || who == 0 || who == 0xFF) continue;
+    imuAddr = (int)a;
+    i2cWrite8(a, 0x6B, 0x00);
+    i2cWrite8(a, 0x1B, 0x00);
+    i2cWrite8(a, 0x1C, 0x00);
+    SerialMon.printf("[IMU] 0x%02X\n", a);
+    return true;
+  }
+  return false;
+}
+
+static float tiltDeg() {
+  if (imuAddr < 0) return 0.0f;
+  uint8_t raw[14];
+  if (!i2cReadBytes((uint8_t)imuAddr, 0x3B, raw, 14)) return 0.0f;
+  int16_t ax = (int16_t)((raw[0] << 8) | raw[1]);
+  int16_t ay = (int16_t)((raw[2] << 8) | raw[3]);
+  int16_t az = (int16_t)((raw[4] << 8) | raw[5]);
+  float axg = ax / 16384.0f, ayg = ay / 16384.0f, azg = az / 16384.0f;
+  float xy = sqrtf(axg * axg + ayg * ayg);
+  return atan2f(xy, fabsf(azg)) * 57.29578f;
+}
+
+static double nmeaCoord(const char *ddmm, char hemi, int degw) {
+  int dot = -1;
+  for (size_t i = 0; ddmm[i] && i < 32; i++)
+    if (ddmm[i] == '.') dot = (int)i;
+  if (dot < degw + 1) return NAN;
+  char dgp[14], mn[18];
+  if ((size_t)dot >= sizeof(dgp)) return NAN;
+  memcpy(dgp, ddmm, (size_t)dot);
+  dgp[(size_t)dot] = 0;
+  strncpy(mn, ddmm + dot, sizeof(mn) - 1);
+  mn[sizeof(mn) - 1] = 0;
+  double o = atof(dgp) + atof(mn) / 60.0;
+  if (hemi == 'S' || hemi == 'W') o = -o;
+  return o;
+}
+
+/* $GPRMC / $GNRMC */
+static void handleRmcLine(char *line) {
+  if (strncmp(line, "$GPRMC", 6) != 0 && strncmp(line, "$GNRMC", 6) != 0) return;
+  char tmp[sizeof(nmea)];
+  strncpy(tmp, line, sizeof(tmp) - 1);
+  tmp[sizeof(tmp) - 1] = 0;
+
+  char *save = nullptr;
+  (void)strtok_r(tmp, ",", &save);
+  (void)strtok_r(nullptr, ",", &save);
+  char *stat = strtok_r(nullptr, ",", &save);
+  if (!stat || stat[0] != 'A') return;
+
+  char *flat = strtok_r(nullptr, ",", &save);
+  char *fh = strtok_r(nullptr, ",", &save);
+  char *flon = strtok_r(nullptr, ",", &save);
+  char *gh = strtok_r(nullptr, ",", &save);
+  if (!flat || !fh || !flon || !gh) return;
+
+  double la = nmeaCoord(flat, fh[0], 2);
+  double lo = nmeaCoord(flon, gh[0], 3);
+  if (!isnan(la) && !isnan(lo)) {
+    gpsLat = la;
+    gpsLon = lo;
+    gpsFix = true;
+  }
+}
+
+static void pollGps() {
+  while (SerialGPS.available()) {
+    char c = (char)SerialGPS.read();
+    if (c == '\n' || c == '\r') {
+      if (nmeaN >= 10 && nmea[0] == '$') {
+        nmea[nmeaN] = 0;
+        handleRmcLine(nmea);
+      }
+      nmeaN = 0;
+    } else if (nmeaN < sizeof(nmea) - 1) {
+      if (c >= ' ' && c <= '~') nmea[nmeaN++] = c;
+      else if (nmeaN > 0) nmeaN = 0;
+    } else
+      nmeaN = 0;
+  }
+}
+
+static int rssiDbm() {
+  int q = modem.getSignalQuality();
+  if (q == 99 || q < 0) return -120;
+  return -113 + q * 2;
+}
+
+static bool ensureGprs() {
+  if (modem.isGprsConnected()) return true;
+  bootLog("[GPRS] gprsConnect...");
+  if (!modem.gprsConnect(APN, APN_USER, APN_PASS)) {
+    bootLog("[GPRS] FAIL");
+    return false;
+  }
+  bootLog("[GPRS] ok");
+  return true;
+}
+
+static bool mqttReconnect() {
+  if (!ensureGprs()) return false;
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(512);
+  String cid = String("trk_") + String((uint32_t)ESP.getEfuseMac(), HEX);
+  if (!mqtt.connect(cid.c_str(), MQTT_USER, MQTT_PASS)) {
+    SerialMon.printf("[MQTT] connect fail rc=%d\n", mqtt.state());
+    return false;
+  }
+  bootLog("[MQTT] connected");
+  return true;
+}
+
+static bool publishMqtt() {
+  if (!mqtt.connected() && !mqttReconnect()) return false;
+
+  float tlt = tiltDeg();
+  StaticJsonDocument<448> doc;
+  if (gpsFix) {
+    doc["lat"] = gpsLat;
+    doc["lng"] = gpsLon;
+  }
+  doc["tiltDeg"] = tlt;
+  doc["rssi"] = rssiDbm();
+  doc["fwVersion"] = FW_VERSION;
+  doc["mode"] = "disarmed";
+  doc["deviceToken"] = deviceToken;
+  if (imeiCached.length()) doc["imei"] = imeiCached;
+
+  char payload[448];
+  size_t L = serializeJson(doc, payload, sizeof(payload));
+  if (!L || L >= sizeof(payload)) return false;
+  if (!mqtt.publish("mit/tracker/ingest", payload)) return false;
+
+  if (gpsFix)
+    SerialMon.printf("[MQTT] ok lat=%.6f lng=%.6f tilt %.1f\n", gpsLat, gpsLon, (double)tlt);
+  else
+    SerialMon.printf("[MQTT] ok lat/lng tilt %.1f\n", (double)tlt);
+  return true;
+}
+
+static void modemPowerOn() {
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(100);
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  delay(1000);
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(2000);
+  if (MODEM_POWER_ON >= 0) {
+    pinMode(MODEM_POWER_ON, OUTPUT);
+    digitalWrite(MODEM_POWER_ON, HIGH);
+    delay(200);
+  }
+}
+
+void setup() {
+  SerialMon.begin(115200);
+  /* Дати ROM вивести рядок на USB; злиття з [BOOT] — не «помилка» логіки, а один UART. */
+  delay(2200);
+  while (SerialMon.available()) (void)SerialMon.read();
+
+  bootLog("");
+  bootLog("[BOOT] firmware " FW_VERSION);
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
+  initImu() ? bootLog("[BOOT] IMU ok") : bootLog("[BOOT] no IMU");
+
+  SerialGPS.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+  bootLog("[BOOT] modem power");
+  modemPowerOn();
+  /* Пік струму модему: не чіпати UART одразу — менше brownout/другого boot. */
+  delay(3500);
+
+  SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(300);
+
+  modem.init();
+  delay(500);
+  modem.setPhoneFunctionality(1, false);
+  delay(2000);
+
+  imeiCached = modem.getIMEI();
+
+  SerialMon.printf("[BOOT] setNetworkMode(%d)\n", (int)MODEM_NETWORK_MODE);
+  modem.setNetworkMode(MODEM_NETWORK_MODE);
+  delay(3000);
+
+  bootLog("[BOOT] gprsConnect (retries)");
+  bool gok = false;
+  for (int attempt = 1; attempt <= 5; attempt++) {
+    if (modem.gprsConnect(APN, APN_USER, APN_PASS)) {
+      gok = true;
+      break;
+    }
+    SerialMon.printf("[BOOT] gprs fail attempt %d/5, wait 6s\n", attempt);
+    delay(6000);
+  }
+  if (!gok) bootLog("[BOOT] WARN gprs still down — loop will retry");
+
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqttReconnect();
+
+  bootLog("[BOOT] done");
+  lastMqttTryMs = millis();
+  lastMqttMs = millis();
+}
+
+void loop() {
+  pollGps();
+  mqtt.loop();
+
+  uint32_t now = millis();
+  if (!mqtt.connected()) {
+    if (lastMqttTryMs == 0 || now - lastMqttTryMs >= MQTT_RETRY_MS) {
+      lastMqttTryMs = now;
+      mqttReconnect();
+    }
+  } else if (now - lastMqttMs >= (uint32_t)MQTT_TELEMETRY_MS) {
+    if (publishMqtt())
+      lastMqttMs = now;
+    else if (mqtt.connected())
+      mqtt.disconnect();
+  }
+
+  delay(20);
+}
