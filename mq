@@ -1,6 +1,6 @@
 /*
  * TTGO T-A7670SA + Neo-M8N + MPU-6050 -> MQTT mit/tracker/ingest
- * Простий варіант: без waitForNetwork (на LTE TinyGSM часто помиляється з CGREG).
+ * RMC+GGA+GSV — fix, координати, супутники, HDOP у JSON.
  */
 #define DEVICE_TOKEN "trk_37d4068b29dad73a49c2cf9c49b3e7bf703272a6"
 #define APN          "internet"
@@ -10,8 +10,7 @@
 #define MQTT_PORT    1883
 #define MQTT_USER    "mit_iot"
 #define MQTT_PASS    "5KtXCmjcPcVriwpYyidzK0"
-#define FW_VERSION   "1.2.1-mqtt-gps-debug"
-/* 2=auto (GSM/WCDMA/LTE); 38=LTE-only — часто не піднімає PDP без LTE. */
+#define FW_VERSION   "1.2.3-gps-gga"
 #ifndef MODEM_NETWORK_MODE
 #define MODEM_NETWORK_MODE 2
 #endif
@@ -24,7 +23,7 @@
 #define MODEM_TX 26
 #define MODEM_PWRKEY 4
 #define MODEM_POWER_ON 12
-#define MQTT_TELEMETRY_MS 3000
+#define MQTT_TELEMETRY_MS 2000
 #define MQTT_RETRY_MS 8000
 
 #define TINY_GSM_MODEM_SIM7600
@@ -51,14 +50,31 @@ static String imeiCached;
 static uint32_t lastMqttMs;
 static uint32_t lastMqttTryMs;
 
-static char nmea[200];
+static char nmea[256];
 static size_t nmeaN;
 static bool gpsFix = false;
 static double gpsLat = 0.0;
 static double gpsLon = 0.0;
+static int gpsSatsUsed = -1;
+static int gpsSatsInView = -1;
+static float gpsHdop = -1.0f;
 
 static int imuAddr = -1;
 static const uint8_t IMU_ADDRS[] = {0x68, 0x69};
+
+static char nmeaTmp[292];
+
+enum { GPS_MAX_CHARS_PER_LOOP = 128 };
+
+static int nmeaCsvFields(char *buf, char **out, int cap) {
+  char *star = strchr(buf, '*');
+  if (star) *star = 0;
+  int nf = 0;
+  char *save = nullptr;
+  for (char *t = strtok_r(buf, ",", &save); t && nf < cap; t = strtok_r(nullptr, ",", &save))
+    out[nf++] = t;
+  return nf;
+}
 
 static void bootLog(const char *msg) {
   SerialMon.println(msg);
@@ -126,17 +142,23 @@ static double nmeaCoord(const char *ddmm, char hemi, int degw) {
   return o;
 }
 
-/* $GPRMC / $GNRMC */
+/** $GPRMC / $GNRMC */
 static void handleRmcLine(char *line) {
-  if (strncmp(line, "$GPRMC", 6) != 0 && strncmp(line, "$GNRMC", 6) != 0) return;
-  char tmp[sizeof(nmea)];
-  strncpy(tmp, line, sizeof(tmp) - 1);
-  tmp[sizeof(tmp) - 1] = 0;
+  if (!strstr(line, "RMC,")) return;
+
+  strncpy(nmeaTmp, line, sizeof(nmeaTmp) - 1);
+  nmeaTmp[sizeof(nmeaTmp) - 1] = 0;
+
+  char *comma = strchr(nmeaTmp, ',');
+  if (!comma) return;
 
   char *save = nullptr;
-  (void)strtok_r(tmp, ",", &save);
-  (void)strtok_r(nullptr, ",", &save);
+  (void)strtok_r(comma + 1, ",", &save);
   char *stat = strtok_r(nullptr, ",", &save);
+  if (stat && stat[0] == 'V') {
+    gpsFix = false;
+    return;
+  }
   if (!stat || stat[0] != 'A') return;
 
   char *flat = strtok_r(nullptr, ",", &save);
@@ -154,13 +176,91 @@ static void handleRmcLine(char *line) {
   }
 }
 
+/** $..GGA */
+static void handleGgaLine(char *line) {
+  if (!strstr(line, "GGA,")) return;
+
+  strncpy(nmeaTmp, line, sizeof(nmeaTmp) - 1);
+  nmeaTmp[sizeof(nmeaTmp) - 1] = 0;
+
+  char *comma = strchr(nmeaTmp, ',');
+  if (!comma) return;
+
+  char fld[22][14];
+  char *tok = comma + 1;
+  size_t nf = 0;
+  while (nf < sizeof(fld) / sizeof(fld[0])) {
+    char *sep = strchr(tok, ',');
+    char *star = strchr(tok, '*');
+    char *cut = sep;
+    if (sep && star && star < sep) cut = nullptr;
+    else if (!sep && star) cut = star;
+    else if (sep && (!star || star > sep)) cut = sep;
+
+    size_t ln = cut ? (size_t)(cut - tok) : strlen(tok);
+    if (ln >= sizeof(fld[0])) ln = sizeof(fld[0]) - 1;
+    memcpy(fld[nf], tok, ln);
+    fld[nf][ln] = 0;
+    nf++;
+    if (!cut || *cut == '*') break;
+    tok = cut + 1;
+  }
+
+  if (nf < 8) return;
+
+  int q = atoi(fld[5]);
+  if (q > 0) gpsFix = true;
+  /* GGA q==0 не скидає fix: RMC(A) вже міг дати координати; інакше довгі NO_FIX при used>0. */
+
+  if (fld[6][0]) gpsSatsUsed = atoi(fld[6]);
+  else if (q > 0) gpsSatsUsed = 0;
+
+  gpsHdop = -1.0f;
+  if (nf > 7 && fld[7][0]) {
+    float h = strtof(fld[7], nullptr);
+    if (h > 0.05f && h < 51.0f) gpsHdop = h;
+  }
+
+  if (q > 0 && fld[1][0] && fld[2][0] && fld[3][0] && fld[4][0]) {
+    double la = nmeaCoord(fld[1], fld[2][0], 2);
+    double lo = nmeaCoord(fld[3], fld[4][0], 3);
+    if (!isnan(la) && !isnan(lo)) {
+      gpsLat = la;
+      gpsLon = lo;
+    }
+  }
+}
+
+/** Перший фрагмент GSV містить загальну кількість видимих супутників у третій колонці після першого коми заголовку. */
+static void handleGsvLine(char *line) {
+  if (!strstr(line, "GSV,")) return;
+
+  strncpy(nmeaTmp, line, sizeof(nmeaTmp) - 1);
+  nmeaTmp[sizeof(nmeaTmp) - 1] = 0;
+
+  char *comma = strchr(nmeaTmp, ',');
+  if (!comma) return;
+
+  char *fld[24];
+  int nf = nmeaCsvFields(comma + 1, fld, 23);
+  if (nf >= 4 && fld[1][0] && atoi(fld[1]) == 1 && fld[2][0])
+    gpsSatsInView = atoi(fld[2]);
+}
+
+static void parseNmeaLine(char *ln) {
+  if (strstr(ln, "RMC,")) handleRmcLine(ln);
+  else if (strstr(ln, "GGA,")) handleGgaLine(ln);
+  else if (strstr(ln, "GSV,")) handleGsvLine(ln);
+}
+
 static void pollGps() {
-  while (SerialGPS.available()) {
+  int drained = 0;
+  while (SerialGPS.available() && drained++ < GPS_MAX_CHARS_PER_LOOP) {
     char c = (char)SerialGPS.read();
     if (c == '\n' || c == '\r') {
-      if (nmeaN >= 10 && nmea[0] == '$') {
+      if (nmeaN >= 8 && nmea[0] == '$') {
         nmea[nmeaN] = 0;
-        handleRmcLine(nmea);
+        parseNmeaLine(nmea);
       }
       nmeaN = 0;
     } else if (nmeaN < sizeof(nmea) - 1) {
@@ -205,7 +305,9 @@ static bool publishMqtt() {
   if (!mqtt.connected() && !mqttReconnect()) return false;
 
   float tlt = tiltDeg();
-  StaticJsonDocument<448> doc;
+  StaticJsonDocument<512> doc;
+
+  doc["gpsFix"] = gpsFix;
   if (gpsFix) {
     doc["lat"] = gpsLat;
     doc["lng"] = gpsLon;
@@ -217,15 +319,23 @@ static bool publishMqtt() {
   doc["deviceToken"] = deviceToken;
   if (imeiCached.length()) doc["imei"] = imeiCached;
 
-  char payload[448];
+  if (gpsSatsUsed >= 0) doc["gpsSatsUsed"] = gpsSatsUsed;
+  if (gpsSatsInView >= 0) doc["gpsSatsInView"] = gpsSatsInView;
+  if (gpsHdop >= 0) doc["gpsHdop"] = gpsHdop;
+
+  char payload[512];
   size_t L = serializeJson(doc, payload, sizeof(payload));
   if (!L || L >= sizeof(payload)) return false;
   if (!mqtt.publish("mit/tracker/ingest", payload)) return false;
 
   if (gpsFix)
-    SerialMon.printf("[MQTT] ok lat=%.6f lng=%.6f tilt %.1f\n", gpsLat, gpsLon, (double)tlt);
+    SerialMon.printf("[MQTT] ok FIX lat=%.6f lng=%.6f used=%d in_view=%d tilt %.1f\n", gpsLat, gpsLon,
+                     gpsSatsUsed >= 0 ? gpsSatsUsed : -1, gpsSatsInView >= 0 ? gpsSatsInView : -1,
+                     (double)tlt);
   else
-    SerialMon.printf("[MQTT] ok lat/lng tilt %.1f\n", (double)tlt);
+    SerialMon.printf("[MQTT] ok NO_FIX used=%d in_view=%d tilt %.1f\n",
+                     gpsSatsUsed >= 0 ? gpsSatsUsed : -1, gpsSatsInView >= 0 ? gpsSatsInView : -1,
+                     (double)tlt);
   return true;
 }
 
@@ -246,7 +356,6 @@ static void modemPowerOn() {
 
 void setup() {
   SerialMon.begin(115200);
-  /* Дати ROM вивести рядок на USB; злиття з [BOOT] — не «помилка» логіки, а один UART. */
   delay(2200);
   while (SerialMon.available()) (void)SerialMon.read();
 
@@ -260,7 +369,6 @@ void setup() {
 
   bootLog("[BOOT] modem power");
   modemPowerOn();
-  /* Пік струму модему: не чіпати UART одразу — менше brownout/другого boot. */
   delay(3500);
 
   SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
