@@ -126,17 +126,29 @@ static float tiltDeg() {
   return atan2f(xy, fabsf(azg)) * 57.29578f;
 }
 
+/* NMEA ddmm.mmmm (lat) / dddmm.mmmm (lon): first degw chars = deg, rest = min. */
 static double nmeaCoord(const char *ddmm, char hemi, int degw) {
+  if (!ddmm || !ddmm[0] || degw < 2) return NAN;
   int dot = -1;
   for (size_t i = 0; ddmm[i] && i < 32; i++)
     if (ddmm[i] == '.') dot = (int)i;
-  if (dot < degw + 1) return NAN;
-  char dgp[14], mn[18];
-  if ((size_t)dot >= sizeof(dgp)) return NAN;
-  memcpy(dgp, ddmm, (size_t)dot);
-  dgp[(size_t)dot] = 0;
-  strncpy(mn, ddmm + dot, sizeof(mn) - 1);
+  if (dot < 1) return NAN;
+
+  int dw = degw;
+  /* Some receivers send lon as "3613.xxx" (36 deg 13 min) not "03613.xxx". */
+  if (degw == 3 && dot == 4 && ddmm[0] != '0') dw = 2;
+
+  size_t len = (size_t)dot;
+  if (len < (size_t)dw + 1) return NAN;
+
+  char dgp[8], mn[18];
+  if (dw >= (int)sizeof(dgp)) return NAN;
+  memcpy(dgp, ddmm, (size_t)dw);
+  dgp[dw] = 0;
+  strncpy(mn, ddmm + dw, sizeof(mn) - 1);
   mn[sizeof(mn) - 1] = 0;
+  if (!mn[0]) return NAN;
+
   double o = atof(dgp) + atof(mn) / 60.0;
   if (hemi == 'S' || hemi == 'W') o = -o;
   return o;
