@@ -7,6 +7,13 @@
  * SIM7600/A7670: AT+CNMP=2 на багатьох прошивках = лише UMTS; без 3G реєстрації GPRS не буде — спробуйте MODEM_NETWORK_MODE 0.
  * LilyGo T-A7670: UART до PWR, потім BOARD_POWERON(12), reset(5), DTR(25)=LOW, PWRKEY — без DTR модем часто мовчить на AT.
  * Інші ревізії (T-Call): інші піни — див. LilyGo utilities.h; задайте MODEM_* / MODEM_RESET_PIN -1 якщо немає reset.
+ *
+ * Демо метрик хаба (тиск):
+ *   - MQTT: mit/<METRICS_HUB_ID>/metrics (дефолт hub=demo) — бекенд уже підписаний mit/+/metrics.
+ *   - Кожні DEMO_HUB_METRICS_INTERVAL_MS трекер шле тестовий JSON (без BLE).
+ *   - Скрипт: cd iot.mit.kh.ua && node scripts/mqtt-publish-demo-metric.js
+ *   - Другий ESP32: firmware/ble-mit-demo-beacon/ (ім'я MITP-DEMO, manufacturer 0x01FF).
+ *   - Вимкнути демо-таймер: #define DEMO_HUB_METRICS_INTERVAL_MS 0
  */
 #define DEVICE_TOKEN "trk_37d4068b29dad73a49c2cf9c49b3e7bf703272a6"
 #define APN          "internet"
@@ -16,7 +23,7 @@
 #define MQTT_PORT    1883
 #define MQTT_USER    "mit_iot"
 #define MQTT_PASS    "5KtXCmjcPcVriwpYyidzK0"
-#define FW_VERSION   "1.4.5-lilygo-dtr-seq"
+#define FW_VERSION   "1.5.2-lilygo-github-defaults"
 #ifndef SIM_PIN
 #define SIM_PIN ""
 #endif
@@ -51,6 +58,7 @@
 #define MODEM_DTR_PIN 25
 #endif
 #ifndef MODEM_RESET_PIN
+/* Як LilyGo-T-A7670X examples/Network.ino (utilities.h): reset GPIO5. Клон без цієї лінії — задайте MODEM_RESET_PIN -1 на початку файлу. */
 #define MODEM_RESET_PIN 5
 #endif
 #ifndef MODEM_RESET_LEVEL
@@ -65,24 +73,27 @@
 #define MQTT_TELEMETRY_MS 2000
 #define MQTT_RETRY_MS 8000
 
-/* 0 = як рання прошивка без BLE. 1 = BLE-метрики (потрібен METRICS_HUB_ID). */
+/* Демо: BLE увімкнено, hub=demo; для продакшену задайте свій METRICS_HUB_ID або ENABLE_BLE_PRESSURE_METRICS 0. */
 #ifndef ENABLE_BLE_PRESSURE_METRICS
-#define ENABLE_BLE_PRESSURE_METRICS 0
+#define ENABLE_BLE_PRESSURE_METRICS 1
 #endif
 #ifndef METRICS_HUB_ID
-#define METRICS_HUB_ID ""
+#define METRICS_HUB_ID "demo"
 #endif
 #ifndef BLE_SCAN_INTERVAL_MS
-#define BLE_SCAN_INTERVAL_MS 45000
+#define BLE_SCAN_INTERVAL_MS 15000
 #endif
 #ifndef BLE_SCAN_DURATION_S
-#define BLE_SCAN_DURATION_S 1
+#define BLE_SCAN_DURATION_S 3
 #endif
 #ifndef BLE_NAME_PREFIX
-#define BLE_NAME_PREFIX ""
+#define BLE_NAME_PREFIX "MITP"
 #endif
 #ifndef BLE_MFGR_COMPANY_ID
-#define BLE_MFGR_COMPANY_ID 0
+#define BLE_MFGR_COMPANY_ID 0x01FF
+#endif
+#ifndef DEMO_HUB_METRICS_INTERVAL_MS
+#define DEMO_HUB_METRICS_INTERVAL_MS 120000
 #endif
 #ifndef BLE_OFF_BATTERY
 #define BLE_OFF_BATTERY 3
@@ -107,6 +118,7 @@
 #define TINY_GSM_RX_BUFFER 1024
 
 #include <Arduino.h>
+#include <WiFi.h>
 #include <esp_system.h>
 #include <Wire.h>
 #include <TinyGsmClient.h>
@@ -723,6 +735,7 @@ static void modemPowerOn() {
 
 void setup() {
   SerialMon.begin(115200);
+  WiFi.mode(WIFI_OFF);
   delay(2200);
   while (SerialMon.available()) (void)SerialMon.read();
 
@@ -732,8 +745,6 @@ void setup() {
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
   initImu() ? bootLog("[BOOT] IMU ok") : bootLog("[BOOT] no IMU");
-
-  SerialGPS.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
   bootLog("[BOOT] modem power");
   SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
@@ -747,6 +758,9 @@ void setup() {
     const char *p = (SIM_PIN[0] != '\0') ? SIM_PIN : nullptr;
     if (!initModemAt(p)) bootLog("[BOOT] WARN modem.init failed (check PWRKEY, RX/TX, power)");
   }
+  SerialGPS.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  bootLog("[BOOT] GPS serial on");
+
   delay(500);
   modem.setPhoneFunctionality(1, false);
   delay(2000);
@@ -784,12 +798,47 @@ void setup() {
   lastMqttMs = millis();
 }
 
+#if DEMO_HUB_METRICS_INTERVAL_MS > 0
+static uint32_t lastDemoHubMs;
+static void pumpDemoHubMetric() {
+  if (!METRICS_HUB_ID[0]) return;
+  if (!mqtt.connected()) return;
+  uint32_t now = millis();
+  if (lastDemoHubMs != 0 && (now - lastDemoHubMs) < (uint32_t)DEMO_HUB_METRICS_INTERVAL_MS) return;
+  lastDemoHubMs = now;
+
+  StaticJsonDocument<512> doc;
+  doc["hub"] = METRICS_HUB_ID;
+  doc["device"] = "DEMO-HUB";
+  doc["mac"] = "de:mo:00:00:01";
+  doc["temp"] = 22.1;
+  doc["press"] = 101.15;
+  doc["battery"] = 88;
+  doc["rssi"] = "-40";
+  doc["fw_version"] = FW_VERSION;
+  if (imeiCached.length()) doc["imei"] = imeiCached.c_str();
+  if (gpsFix) {
+    doc["hub_lat"] = String(gpsLat, 6);
+    doc["hub_lng"] = String(gpsLon, 6);
+  }
+  char payload[512];
+  size_t L = serializeJson(doc, payload, sizeof(payload));
+  if (!L || L >= sizeof(payload)) return;
+  char topic[96];
+  snprintf(topic, sizeof(topic), "mit/%s/metrics", METRICS_HUB_ID);
+  if (mqtt.publish(topic, payload)) SerialMon.println("[DEMO] mit/<hub>/metrics sample published");
+}
+#endif
+
 void loop() {
   pollGps();
 #if ENABLE_BLE_PRESSURE_METRICS
   bleScanAndPublishMetrics();
 #endif
   mqtt.loop();
+#if DEMO_HUB_METRICS_INTERVAL_MS > 0
+  pumpDemoHubMetric();
+#endif
 
   uint32_t now = millis();
   if (!mqtt.connected()) {
